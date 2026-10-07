@@ -408,6 +408,18 @@ final class PgmqTest extends TestCase
         self::assertTrue($queue->isNotifyInsertEnabled());
     }
 
+    public function testEnsureNotifyInsertWorksInsideAnOpenTransaction(): void
+    {
+        $queue = createQueue($this->pg, $this->randomQueueName());
+
+        $tx = $this->pg->beginTransaction();
+        ensureNotifyInsert($tx, $queue->name);
+        self::assertTrue(isNotifyInsertEnabled($tx, $queue->name));
+        $tx->rollback();
+
+        self::assertFalse($queue->isNotifyInsertEnabled(), 'the setup belongs to the caller\'s transaction');
+    }
+
     public function testEnsureNotifyInsertChangesThrottleWithoutRecreatingTrigger(): void
     {
         $queue = createQueue($this->pg, $this->randomQueueName());
