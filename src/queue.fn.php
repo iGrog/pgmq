@@ -468,10 +468,18 @@ function enableNotifyInsert(
 }
 
 /**
- * Enables insert notifications only when they are not already enabled with the same throttle interval.
- * Unlike {@see enableNotifyInsert()}, which always recreates the trigger, an existing setup is left untouched:
- * recreating the trigger takes a table lock that waits for every open transaction inserting into the queue
- * and blocks new inserts meanwhile.
+ * Makes insert notifications work for the queue, touching the trigger only when it is really needed:
+ *
+ * * already enabled with this throttle interval → nothing (catalog reads only, no lock on the queue table);
+ * * enabled with another interval → `pgmq.update_notify_insert()` (no DDL);
+ * * missing, disabled or calling another function, or the throttle row is gone → `pgmq.enable_notify_insert()`.
+ *
+ * The throttle row lives in an UNLOGGED table: crash recovery (or a promoted replica) empties it while the trigger
+ * survives, and the trigger then never notifies. That is why the row is checked, not only the trigger.
+ *
+ * Check and change run in one transaction under `pgmq.acquire_queue_lock()` (the lock pgmq itself takes to create and
+ * drop the queue), so consumers starting together do not race into the DDL: the first one sets notifications up, the
+ * others wait for it and then find them in place.
  *
  * @api
  * @param non-empty-string $queue
@@ -482,15 +490,40 @@ function ensureNotifyInsert(
     string $queue,
     ?TimeSpan $throttleInterval = null,
 ): string {
-    if (!isNotifyInsertEnabled($pg, $queue, $throttleInterval)) {
-        enableNotifyInsert($pg, $queue, $throttleInterval);
+    $throttleMs = notifyThrottleMs($throttleInterval);
+    $tx = $pg->beginTransaction();
+
+    try {
+        $tx->execute('SELECT pgmq.acquire_queue_lock(:queue_name)', ['queue_name' => $queue]);
+        $state = notifyInsertState($tx, $queue);
+
+        if (!$state->triggerValid || $state->throttleIntervalMs === null) {
+            $tx->execute('SELECT pgmq.enable_notify_insert(:queue_name, :throttle_interval_ms)', [
+                'queue_name' => $queue,
+                'throttle_interval_ms' => $throttleMs,
+            ]);
+        } elseif ($state->throttleIntervalMs !== $throttleMs) {
+            $tx->execute('SELECT pgmq.update_notify_insert(:queue_name, :throttle_interval_ms)', [
+                'queue_name' => $queue,
+                'throttle_interval_ms' => $throttleMs,
+            ]);
+        }
+
+        $tx->commit();
+    } catch (\Throwable $e) {
+        if ($tx->isActive()) {
+            $tx->rollback();
+        }
+
+        throw $e;
     }
 
     return channelName($queue);
 }
 
 /**
- * Reads the catalog only: takes no lock on the queue table.
+ * Whether insert notifications work for the queue with this throttle interval: the trigger exists, is enabled and
+ * calls `pgmq.notify_queue_listeners()`, and the throttle row is in place. Reads the catalog only.
  *
  * @api
  * @param non-empty-string $queue
@@ -500,32 +533,47 @@ function isNotifyInsertEnabled(
     string $queue,
     ?TimeSpan $throttleInterval = null,
 ): bool {
-    /** @var ?array{enabled: bool} $row */
+    $state = notifyInsertState($pg, $queue);
+
+    return $state->triggerValid && $state->throttleIntervalMs === notifyThrottleMs($throttleInterval);
+}
+
+/**
+ * @internal
+ * @param non-empty-string $queue
+ */
+function notifyInsertState(PostgresLink $pg, string $queue): Internal\NotifyInsertState
+{
+    /** @var array{trigger_valid: bool, throttle_interval_ms: ?int} $row */
     $row = $pg
         ->execute(
             <<<'SQL'
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM pgmq.notify_insert_throttle t
-                    WHERE t.queue_name = :queue_name AND t.throttle_interval_ms = :throttle_interval_ms
-                ) AND EXISTS (
-                    SELECT 1
-                    FROM pg_trigger tg
-                    JOIN pg_class c ON c.oid = tg.tgrelid
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = 'pgmq'
-                      AND c.relname = pgmq.format_table_name(:queue_name, 'q')
-                      AND tg.tgname = 'trigger_notify_queue_insert_listeners'
-                ) AS enabled
+                SELECT
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_trigger tg
+                        JOIN pg_class c ON c.oid = tg.tgrelid
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'pgmq'
+                          AND c.relname = pgmq.format_table_name(:queue_name, 'q')
+                          AND tg.tgname = 'trigger_notify_queue_insert_listeners'
+                          AND tg.tgenabled IN ('O', 'A')
+                          AND tg.tgfoid = 'pgmq.notify_queue_listeners()'::regprocedure
+                    ) AS trigger_valid,
+                    (
+                        SELECT t.throttle_interval_ms
+                        FROM pgmq.notify_insert_throttle t
+                        WHERE t.queue_name = :queue_name
+                    ) AS throttle_interval_ms
                 SQL,
-            [
-                'queue_name' => $queue,
-                'throttle_interval_ms' => notifyThrottleMs($throttleInterval),
-            ],
+            ['queue_name' => $queue],
         )
         ->fetchRow();
 
-    return $row !== null && $row['enabled'];
+    return new Internal\NotifyInsertState(
+        triggerValid: $row['trigger_valid'],
+        throttleIntervalMs: $row['throttle_interval_ms'],
+    );
 }
 
 /**
