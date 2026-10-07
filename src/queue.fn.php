@@ -461,10 +461,79 @@ function enableNotifyInsert(
 ): string {
     $pg->execute('SELECT pgmq.enable_notify_insert(:queue_name, :throttle_interval_ms)', [
         'queue_name' => $queue,
-        'throttle_interval_ms' => ($throttleInterval ?? TimeSpan::fromMilliseconds(30))->toMilliseconds(),
+        'throttle_interval_ms' => notifyThrottleMs($throttleInterval),
     ]);
 
     return channelName($queue);
+}
+
+/**
+ * Enables insert notifications only when they are not already enabled with the same throttle interval.
+ * Unlike {@see enableNotifyInsert()}, which always recreates the trigger, an existing setup is left untouched:
+ * recreating the trigger takes a table lock that waits for every open transaction inserting into the queue
+ * and blocks new inserts meanwhile.
+ *
+ * @api
+ * @param non-empty-string $queue
+ * @return non-empty-string
+ */
+function ensureNotifyInsert(
+    PostgresLink $pg,
+    string $queue,
+    ?TimeSpan $throttleInterval = null,
+): string {
+    if (!isNotifyInsertEnabled($pg, $queue, $throttleInterval)) {
+        enableNotifyInsert($pg, $queue, $throttleInterval);
+    }
+
+    return channelName($queue);
+}
+
+/**
+ * Reads the catalog only: takes no lock on the queue table.
+ *
+ * @api
+ * @param non-empty-string $queue
+ */
+function isNotifyInsertEnabled(
+    PostgresLink $pg,
+    string $queue,
+    ?TimeSpan $throttleInterval = null,
+): bool {
+    /** @var ?array{enabled: bool} $row */
+    $row = $pg
+        ->execute(
+            <<<'SQL'
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pgmq.notify_insert_throttle t
+                    WHERE t.queue_name = :queue_name AND t.throttle_interval_ms = :throttle_interval_ms
+                ) AND EXISTS (
+                    SELECT 1
+                    FROM pg_trigger tg
+                    JOIN pg_class c ON c.oid = tg.tgrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'pgmq'
+                      AND c.relname = pgmq.format_table_name(:queue_name, 'q')
+                      AND tg.tgname = 'trigger_notify_queue_insert_listeners'
+                ) AS enabled
+                SQL,
+            [
+                'queue_name' => $queue,
+                'throttle_interval_ms' => notifyThrottleMs($throttleInterval),
+            ],
+        )
+        ->fetchRow();
+
+    return $row !== null && $row['enabled'];
+}
+
+/**
+ * @internal
+ */
+function notifyThrottleMs(?TimeSpan $throttleInterval): int
+{
+    return ($throttleInterval ?? TimeSpan::fromMilliseconds(30))->toMilliseconds();
 }
 
 /**

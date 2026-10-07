@@ -8,10 +8,12 @@ use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnection;
 use Amp\Postgres\PostgresConnectionPool;
 use Amp\Postgres\PostgresQueryError;
+use Amp\TimeoutCancellation;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DoesNotPerformAssertions;
 use PHPUnit\Framework\TestCase;
 use Thesis\Time\TimeSpan;
+use function Amp\async;
 use function Amp\delay;
 
 #[CoversClass(Queue::class)]
@@ -274,6 +276,56 @@ final class PgmqTest extends TestCase
         self::assertSame(channelName($queue->name), $queue->enableNotifyInsert(TimeSpan::fromSeconds(1)));
 
         $queue->disableNotifyInsert();
+    }
+
+    public function testConsumerStartDoesNotWaitForProducerTransactions(): void
+    {
+        $queue = createQueue($this->pg, $this->randomQueueName());
+        $queue->enableNotifyInsert();
+
+        // A producer is in the middle of a transaction that has already inserted into the queue.
+        $producer = $this->pg->beginTransaction();
+        send($producer, $queue->name, new SendMessage(self::TESTING_MESSAGE));
+
+        $pg = $this->pg;
+
+        try {
+            // A worker (re)starts: notifications are already set up, so it must not touch the trigger. Recreating it
+            // takes a table lock that waits for every open producer transaction and blocks new inserts meanwhile.
+            /** @var ConsumeContext $context */
+            $context = async(static fn(): ConsumeContext => createConsumer($pg)->consume(
+                static function (): void {},
+                new ConsumeConfig($queue->name),
+            ))->await(new TimeoutCancellation(1));
+
+            $context->stop();
+            $context->awaitCompletion();
+        } finally {
+            $producer->rollback();
+        }
+
+        self::assertTrue($queue->isNotifyInsertEnabled());
+    }
+
+    public function testEnsureNotifyInsertKeepsExistingSetupAndEnablesMissingOne(): void
+    {
+        $queue = createQueue($this->pg, $this->randomQueueName());
+
+        self::assertFalse($queue->isNotifyInsertEnabled());
+        self::assertSame(channelName($queue->name), $queue->ensureNotifyInsert());
+        self::assertTrue($queue->isNotifyInsertEnabled());
+
+        // Already enabled with the same throttle: nothing to do.
+        self::assertSame(channelName($queue->name), $queue->ensureNotifyInsert());
+        self::assertTrue($queue->isNotifyInsertEnabled());
+
+        // A different throttle is a different setup: it is applied.
+        $queue->ensureNotifyInsert(TimeSpan::fromSeconds(1));
+        self::assertTrue($queue->isNotifyInsertEnabled(TimeSpan::fromSeconds(1)));
+        self::assertFalse($queue->isNotifyInsertEnabled());
+
+        $queue->disableNotifyInsert();
+        self::assertFalse($queue->isNotifyInsertEnabled(TimeSpan::fromSeconds(1)));
     }
 
     public function testInvalidConsumerConfiguration(): void
